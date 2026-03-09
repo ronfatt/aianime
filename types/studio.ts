@@ -46,6 +46,7 @@ export interface StudioScene {
 export type EpisodeStatus = "draft" | "scenes" | "storyboard" | "generated" | "exported";
 export type RenderTaskKind = "image" | "video";
 export type RenderTaskStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
+export type RenderProvider = string;
 
 export interface RenderTask {
   id: string;
@@ -54,7 +55,7 @@ export interface RenderTask {
   sceneId: string;
   sceneTitle: string;
   kind: RenderTaskKind;
-  provider: string;
+  provider: RenderProvider;
   status: RenderTaskStatus;
   prompt: string;
   payload: string;

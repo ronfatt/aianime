@@ -11,6 +11,14 @@ import {
   SCENE_COUNTS,
 } from "@/lib/constants";
 import { fullOutputCopy, toFilmPackMarkdown, toFilmPackText } from "@/lib/formatters";
+import {
+  buildRenderProviderPayload,
+  DEFAULT_IMAGE_PROVIDER,
+  DEFAULT_VIDEO_PROVIDER,
+  getProviderDefinition,
+  getProvidersByKind,
+  type RenderProviderId,
+} from "@/lib/render-providers";
 import { toSeriesMarkdown, toSeriesText } from "@/lib/series-export";
 import {
   buildDefaultEpisodes,
@@ -157,6 +165,8 @@ interface WorkspaceSnapshot {
   lockedVoiceOver: string;
   masterReferenceUrls: string;
   renderQueue: RenderTask[];
+  imageProvider?: RenderProviderId;
+  videoProvider?: RenderProviderId;
 }
 
 const STORAGE_KEY = "anime-pack-studio:saved-packs";
@@ -310,32 +320,6 @@ function renderTaskTone(status: RenderTask["status"]): string {
   }
 }
 
-function buildVideoProviderPayload(input: {
-  episodeNumber: number;
-  sceneTitle: string;
-  provider: string;
-  prompt: string;
-  durationSeconds: number;
-  camera: string;
-  lighting: string;
-}): string {
-  return JSON.stringify(
-    {
-      provider: input.provider,
-      kind: "video",
-      episode: input.episodeNumber,
-      sceneTitle: input.sceneTitle,
-      prompt: input.prompt,
-      durationSeconds: input.durationSeconds,
-      camera: input.camera,
-      lighting: input.lighting,
-      aspectRatio: "9:16",
-    },
-    null,
-    2
-  );
-}
-
 export function FilmPackStudio() {
   const importInputRef = useRef<HTMLInputElement | null>(null);
   const [series, setSeries] = useState<StudioSeries>(defaultSeries);
@@ -376,6 +360,8 @@ export function FilmPackStudio() {
   const [renderQueue, setRenderQueue] = useState<RenderTask[]>([]);
   const [queueKindFilter, setQueueKindFilter] = useState<RenderTask["kind"] | "all">("all");
   const [queueStatusFilter, setQueueStatusFilter] = useState<RenderTask["status"] | "all">("all");
+  const [imageProvider, setImageProvider] = useState<RenderProviderId>(DEFAULT_IMAGE_PROVIDER);
+  const [videoProvider, setVideoProvider] = useState<RenderProviderId>(DEFAULT_VIDEO_PROVIDER);
 
   const selectedEpisode = useMemo(
     () => episodes.find((episode) => episode.id === selectedEpisodeId) || episodes[0],
@@ -496,6 +482,8 @@ export function FilmPackStudio() {
       if (typeof snapshot.lockedVoiceOver === "string") setLockedVoiceOver(snapshot.lockedVoiceOver);
       if (typeof snapshot.masterReferenceUrls === "string") setMasterReferenceUrls(snapshot.masterReferenceUrls);
       if (Array.isArray(snapshot.renderQueue)) setRenderQueue(snapshot.renderQueue as RenderTask[]);
+      if (snapshot.imageProvider) setImageProvider(snapshot.imageProvider);
+      if (snapshot.videoProvider) setVideoProvider(snapshot.videoProvider);
     } catch {
       // Ignore malformed persisted workspace and continue with defaults.
     } finally {
@@ -522,6 +510,8 @@ export function FilmPackStudio() {
       lockedVoiceOver,
       masterReferenceUrls,
       renderQueue,
+      imageProvider,
+      videoProvider,
     };
 
     localStorage.setItem(WORKSPACE_STORAGE_KEY, JSON.stringify(snapshot));
@@ -541,6 +531,8 @@ export function FilmPackStudio() {
     style,
     world,
     renderQueue,
+    imageProvider,
+    videoProvider,
     workspaceReady,
   ]);
 
@@ -1156,7 +1148,7 @@ export function FilmPackStudio() {
   };
 
   const queueCurrentEpisodeTasks = (kind: RenderTask["kind"]) => {
-    const provider = kind === "image" ? "gemini" : "kling";
+    const provider = kind === "image" ? imageProvider : videoProvider;
 
     setRenderQueue((current) => {
       const freshTasks = current.filter(
@@ -1173,18 +1165,16 @@ export function FilmPackStudio() {
         provider,
         status: "queued" as const,
         prompt: kind === "image" ? scene.shot.imagePrompt : scene.shot.videoPrompt,
-        payload:
-          kind === "image"
-            ? scene.shot.imagePrompt
-            : buildVideoProviderPayload({
-                episodeNumber: selectedEpisode.episodeNumber,
-                sceneTitle: scene.title,
-                provider,
-                prompt: scene.shot.videoPrompt,
-                durationSeconds: scene.shot.durationSeconds,
-                camera: scene.shot.camera,
-                lighting: scene.shot.lighting,
-              }),
+        payload: buildRenderProviderPayload({
+          providerId: provider,
+          episodeNumber: selectedEpisode.episodeNumber,
+          sceneTitle: scene.title,
+          prompt: kind === "image" ? scene.shot.imagePrompt : scene.shot.videoPrompt,
+          durationSeconds: scene.shot.durationSeconds,
+          camera: scene.shot.camera,
+          lighting: scene.shot.lighting,
+          aspectRatio: "9:16",
+        }),
         createdAt: new Date().toISOString(),
       }));
 
@@ -1368,6 +1358,8 @@ export function FilmPackStudio() {
       lockedVoiceOver,
       masterReferenceUrls,
       renderQueue,
+      imageProvider,
+      videoProvider,
     };
 
     downloadFile(
@@ -1399,6 +1391,8 @@ export function FilmPackStudio() {
       setLockedVoiceOver(snapshot.lockedVoiceOver || "");
       setMasterReferenceUrls(snapshot.masterReferenceUrls || "");
       setRenderQueue(snapshot.renderQueue || []);
+      setImageProvider(snapshot.imageProvider || DEFAULT_IMAGE_PROVIDER);
+      setVideoProvider(snapshot.videoProvider || DEFAULT_VIDEO_PROVIDER);
       setResult(null);
       setBeatSheet([]);
       setBeatSceneCount(null);
@@ -2161,6 +2155,36 @@ export function FilmPackStudio() {
             </div>
             <div className="mb-3 grid gap-2 sm:grid-cols-2">
               <label className="grid gap-1 text-[11px] text-zinc-400">
+                <span>Image Provider</span>
+                <select
+                  value={imageProvider}
+                  onChange={(event) => setImageProvider(event.target.value as RenderProviderId)}
+                  className="rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-xs text-zinc-200 outline-none ring-cyan-300/40 focus:ring"
+                >
+                  {getProvidersByKind("image").map((provider) => (
+                    <option key={provider.id} value={provider.id}>
+                      {provider.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="grid gap-1 text-[11px] text-zinc-400">
+                <span>Video Provider</span>
+                <select
+                  value={videoProvider}
+                  onChange={(event) => setVideoProvider(event.target.value as RenderProviderId)}
+                  className="rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-xs text-zinc-200 outline-none ring-cyan-300/40 focus:ring"
+                >
+                  {getProvidersByKind("video").map((provider) => (
+                    <option key={provider.id} value={provider.id}>
+                      {provider.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+            <div className="mb-3 grid gap-2 sm:grid-cols-2">
+              <label className="grid gap-1 text-[11px] text-zinc-400">
                 <span>Kind Filter</span>
                 <select
                   value={queueKindFilter}
@@ -2216,7 +2240,9 @@ export function FilmPackStudio() {
                       <div className="flex items-center justify-between gap-2">
                         <div>
                           <p className="text-sm font-medium text-zinc-100">{task.sceneTitle}</p>
-                          <p className="text-[11px] text-zinc-500">{task.kind} via {task.provider}</p>
+                          <p className="text-[11px] text-zinc-500">
+                            {task.kind} via {getProviderDefinition(task.provider as RenderProviderId).label}
+                          </p>
                         </div>
                         <span className={`rounded-full border px-2 py-0.5 text-[10px] font-medium ${renderTaskTone(task.status)}`}>
                           {task.status}
