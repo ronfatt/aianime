@@ -2,6 +2,7 @@
 
 import { ChangeEvent, useEffect, useMemo, useRef, useState } from "react";
 import { CopyButton } from "@/components/copy-button";
+import { InfoTip } from "@/components/info-tip";
 import { RulesPanel } from "@/components/rules-panel";
 import { SceneCard } from "@/components/scene-card";
 import {
@@ -17,6 +18,7 @@ import {
   DEFAULT_VIDEO_PROVIDER,
   getProviderDefinition,
   getProvidersByKind,
+  getVideoProviderAdapter,
   type RenderProviderId,
 } from "@/lib/render-providers";
 import { toSeriesMarkdown, toSeriesText } from "@/lib/series-export";
@@ -171,6 +173,33 @@ interface WorkspaceSnapshot {
 
 const STORAGE_KEY = "anime-pack-studio:saved-packs";
 const WORKSPACE_STORAGE_KEY = "anime-pack-studio:workspace";
+const STUDIO_STEPS = [
+  {
+    step: "Step 1",
+    title: "Story Lab",
+    description: "Start with one idea, then generate the series title, premise, season arc, and episode list.",
+  },
+  {
+    step: "Step 2",
+    title: "World Setup",
+    description: "Define the project look, world rules, and main character so all later scenes stay consistent.",
+  },
+  {
+    step: "Step 3",
+    title: "Series Map",
+    description: "Review the season overview, pick an episode, and track cliffhangers across the series.",
+  },
+  {
+    step: "Step 4",
+    title: "Episode Build",
+    description: "Generate scenes, storyboard beats, prompts, and the episode pack for one selected episode.",
+  },
+  {
+    step: "Step 5",
+    title: "Assets and Video",
+    description: "Queue scene images first, then send each scene into video generation and monitor task status.",
+  },
+] as const;
 
 function getColorGradeLock(preset: ColorGradePreset, style: FilmTone): string {
   switch (preset) {
@@ -306,7 +335,9 @@ function statusTone(status: EpisodeStatus): string {
 
 function renderTaskTone(status: RenderTask["status"]): string {
   switch (status) {
-    case "running":
+    case "submitted":
+      return "border-sky-300/20 bg-sky-400/10 text-sky-200";
+    case "processing":
       return "border-amber-300/20 bg-amber-400/10 text-amber-200";
     case "completed":
       return "border-emerald-300/20 bg-emerald-400/10 text-emerald-200";
@@ -318,6 +349,21 @@ function renderTaskTone(status: RenderTask["status"]): string {
     default:
       return "border-white/10 bg-white/[0.04] text-zinc-400";
   }
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function normalizeRenderTask(task: RenderTask): RenderTask {
+  const legacyStatus = task.status as RenderTask["status"] | "running";
+  const status = legacyStatus === "running" ? "processing" : legacyStatus;
+
+  return {
+    ...task,
+    status,
+    attempts: task.attempts || 0,
+  };
 }
 
 export function FilmPackStudio() {
@@ -481,7 +527,9 @@ export function FilmPackStudio() {
       if (typeof snapshot.storyIdea === "string") setStoryIdea(snapshot.storyIdea);
       if (typeof snapshot.lockedVoiceOver === "string") setLockedVoiceOver(snapshot.lockedVoiceOver);
       if (typeof snapshot.masterReferenceUrls === "string") setMasterReferenceUrls(snapshot.masterReferenceUrls);
-      if (Array.isArray(snapshot.renderQueue)) setRenderQueue(snapshot.renderQueue as RenderTask[]);
+      if (Array.isArray(snapshot.renderQueue)) {
+        setRenderQueue((snapshot.renderQueue as RenderTask[]).map(normalizeRenderTask));
+      }
       if (snapshot.imageProvider) setImageProvider(snapshot.imageProvider);
       if (snapshot.videoProvider) setVideoProvider(snapshot.videoProvider);
     } catch {
@@ -1155,28 +1203,47 @@ export function FilmPackStudio() {
         (task) => !(task.episodeId === selectedEpisode.id && task.kind === kind && task.status === "queued")
       );
 
-      const additions = currentScenes.map((scene) => ({
-        id: crypto.randomUUID(),
-        episodeId: selectedEpisode.id,
-        episodeNumber: selectedEpisode.episodeNumber,
-        sceneId: scene.id,
-        sceneTitle: scene.title,
-        kind,
-        provider,
-        status: "queued" as const,
-        prompt: kind === "image" ? scene.shot.imagePrompt : scene.shot.videoPrompt,
-        payload: buildRenderProviderPayload({
-          providerId: provider,
+      const additions = currentScenes.map((scene) => {
+        const completedImageTask = current
+          .slice()
+          .reverse()
+          .find(
+            (task) =>
+              task.episodeId === selectedEpisode.id &&
+              task.sceneId === scene.id &&
+              task.kind === "image" &&
+              task.status === "completed" &&
+              typeof task.outputUrl === "string"
+          );
+        const inputImageUrl =
+          kind === "video" ? completedImageTask?.outputUrl || officialMasterReference || effectiveMasterReferences[0] : undefined;
+
+        return {
+          id: crypto.randomUUID(),
+          episodeId: selectedEpisode.id,
           episodeNumber: selectedEpisode.episodeNumber,
+          sceneId: scene.id,
           sceneTitle: scene.title,
+          kind,
+          provider,
+          status: "queued" as const,
           prompt: kind === "image" ? scene.shot.imagePrompt : scene.shot.videoPrompt,
-          durationSeconds: scene.shot.durationSeconds,
-          camera: scene.shot.camera,
-          lighting: scene.shot.lighting,
-          aspectRatio: "9:16",
-        }),
-        createdAt: new Date().toISOString(),
-      }));
+          inputImageUrl,
+          payload: buildRenderProviderPayload({
+            providerId: provider,
+            episodeNumber: selectedEpisode.episodeNumber,
+            sceneTitle: scene.title,
+            prompt: kind === "image" ? scene.shot.imagePrompt : scene.shot.videoPrompt,
+            promptImage: inputImageUrl,
+            durationSeconds: scene.shot.durationSeconds,
+            camera: scene.shot.camera,
+            lighting: scene.shot.lighting,
+            aspectRatio: "9:16",
+          }),
+          attempts: 0,
+          createdAt: new Date().toISOString(),
+        };
+      });
 
       return [...freshTasks, ...additions];
     });
@@ -1186,7 +1253,18 @@ export function FilmPackStudio() {
     setRenderQueue((current) =>
       current.map((task) =>
         task.id === taskId && (task.status === "failed" || task.status === "cancelled")
-          ? { ...task, status: "queued", error: "", outputUrl: undefined }
+          ? {
+              ...task,
+              status: "queued",
+              error: "",
+              outputUrl: undefined,
+              providerJobId: undefined,
+              submittedAt: undefined,
+              processingAt: undefined,
+              completedAt: undefined,
+              failedAt: undefined,
+              cancelledAt: undefined,
+            }
           : task
       )
     );
@@ -1195,8 +1273,9 @@ export function FilmPackStudio() {
   const cancelRenderTask = (taskId: string) => {
     setRenderQueue((current) =>
       current.map((task) =>
-        task.id === taskId && (task.status === "queued" || task.status === "running")
-          ? { ...task, status: "cancelled", error: task.error || "" }
+        task.id === taskId &&
+        (task.status === "queued" || task.status === "submitted" || task.status === "processing")
+          ? { ...task, status: "cancelled", error: task.error || "", cancelledAt: new Date().toISOString() }
           : task
       )
     );
@@ -1206,7 +1285,18 @@ export function FilmPackStudio() {
     setRenderQueue((current) =>
       current.map((task) =>
         task.episodeId === selectedEpisode.id && (task.status === "failed" || task.status === "cancelled")
-          ? { ...task, status: "queued", error: "", outputUrl: undefined }
+          ? {
+              ...task,
+              status: "queued",
+              error: "",
+              outputUrl: undefined,
+              providerJobId: undefined,
+              submittedAt: undefined,
+              processingAt: undefined,
+              completedAt: undefined,
+              failedAt: undefined,
+              cancelledAt: undefined,
+            }
           : task
       )
     );
@@ -1215,8 +1305,9 @@ export function FilmPackStudio() {
   const cancelActiveEpisodeTasks = () => {
     setRenderQueue((current) =>
       current.map((task) =>
-        task.episodeId === selectedEpisode.id && (task.status === "queued" || task.status === "running")
-          ? { ...task, status: "cancelled", error: task.error || "" }
+        task.episodeId === selectedEpisode.id &&
+        (task.status === "queued" || task.status === "submitted" || task.status === "processing")
+          ? { ...task, status: "cancelled", error: task.error || "", cancelledAt: new Date().toISOString() }
           : task
       )
     );
@@ -1235,9 +1326,37 @@ export function FilmPackStudio() {
     let cancelled = false;
 
     const run = async () => {
+      const submittedAt = new Date().toISOString();
+      const providerJobId = `${nextTask.provider}-${crypto.randomUUID()}`;
+
       setRenderQueue((current) =>
         current.map((task) =>
-          task.id === nextTask.id && task.status === "queued" ? { ...task, status: "running" } : task
+          task.id === nextTask.id && task.status === "queued"
+            ? {
+                ...task,
+                status: "submitted",
+                providerJobId,
+                attempts: (task.attempts || 0) + 1,
+                submittedAt,
+                processingAt: undefined,
+                completedAt: undefined,
+                failedAt: undefined,
+                cancelledAt: undefined,
+                error: "",
+              }
+            : task
+        )
+      );
+
+      await sleep(150);
+      if (cancelled) return;
+
+      const processingAt = new Date().toISOString();
+      setRenderQueue((current) =>
+        current.map((task) =>
+          task.id === nextTask.id && task.status === "submitted"
+            ? { ...task, status: "processing", processingAt }
+            : task
         )
       );
 
@@ -1285,7 +1404,13 @@ export function FilmPackStudio() {
             task.id === nextTask.id
               ? task.status === "cancelled"
                 ? task
-                : { ...task, status: "completed", outputUrl: payload.imageDataUrl, error: "" }
+                : {
+                    ...task,
+                    status: "completed",
+                    outputUrl: payload.imageDataUrl,
+                    error: "",
+                    completedAt: new Date().toISOString(),
+                  }
               : task
           )
         );
@@ -1300,6 +1425,7 @@ export function FilmPackStudio() {
                     ...task,
                     status: "failed",
                     error: error instanceof Error ? error.message : "Render task failed.",
+                    failedAt: new Date().toISOString(),
                   }
               : task
           )
@@ -1328,14 +1454,143 @@ export function FilmPackStudio() {
     const queuedVideos = renderQueue.filter((task) => task.status === "queued" && task.kind === "video");
     if (queuedVideos.length === 0) return;
 
-    setRenderQueue((current) =>
-      current.map((task) =>
-        task.kind === "video" && task.status === "queued"
-          ? { ...task, status: "completed" }
-          : task
-      )
-    );
-  }, [renderQueue]);
+    let cancelled = false;
+
+    const run = async () => {
+      const firstVideo = queuedVideos[0];
+      const adapter = getVideoProviderAdapter(firstVideo.provider as RenderProviderId);
+
+      try {
+        const submission = await adapter.submitJob({
+          providerId: firstVideo.provider as RenderProviderId,
+          episodeNumber: firstVideo.episodeNumber,
+          sceneTitle: firstVideo.sceneTitle,
+          prompt: firstVideo.prompt,
+          promptImage: firstVideo.inputImageUrl || officialMasterReference || effectiveMasterReferences[0] || "",
+          durationSeconds:
+            episodes
+              .find((episode) => episode.id === firstVideo.episodeId)
+              ?.scenes.find((scene) => scene.id === firstVideo.sceneId)?.shot.durationSeconds || 5,
+          camera:
+            episodes
+              .find((episode) => episode.id === firstVideo.episodeId)
+              ?.scenes.find((scene) => scene.id === firstVideo.sceneId)?.shot.camera || "cinematic vertical tracking",
+          lighting:
+            episodes
+              .find((episode) => episode.id === firstVideo.episodeId)
+              ?.scenes.find((scene) => scene.id === firstVideo.sceneId)?.shot.lighting || "stylized dramatic lighting",
+          aspectRatio: "9:16",
+        });
+
+        setRenderQueue((current) =>
+          current.map((task) =>
+            task.id === firstVideo.id && task.status === "queued"
+              ? {
+                  ...task,
+                  status: submission.status,
+                  providerJobId: submission.providerJobId,
+                  attempts: (task.attempts || 0) + 1,
+                  submittedAt: submission.acceptedAt,
+                  processingAt: undefined,
+                  completedAt: undefined,
+                  failedAt: undefined,
+                  cancelledAt: undefined,
+                  error: "",
+                }
+              : task
+          )
+        );
+
+        while (!cancelled) {
+          await sleep(250);
+          const snapshot = await adapter.getJobStatus(submission.providerJobId);
+          if (cancelled) return;
+
+          if (snapshot.status === "submitted") {
+            setRenderQueue((current) =>
+              current.map((task) =>
+                task.id === firstVideo.id && task.status !== "cancelled"
+                  ? { ...task, status: "submitted" }
+                  : task
+              )
+            );
+            continue;
+          }
+
+          if (snapshot.status === "processing") {
+            setRenderQueue((current) =>
+              current.map((task) =>
+                task.id === firstVideo.id && task.status !== "cancelled"
+                  ? {
+                      ...task,
+                      status: "processing",
+                      processingAt: task.processingAt || new Date().toISOString(),
+                    }
+                  : task
+              )
+            );
+            continue;
+          }
+
+          if (snapshot.status === "completed") {
+            setRenderQueue((current) =>
+              current.map((task) =>
+                task.id === firstVideo.id
+                  ? task.status === "cancelled"
+                    ? task
+                    : {
+                        ...task,
+                        status: "completed",
+                        outputUrl: snapshot.outputUrl,
+                        completedAt: new Date().toISOString(),
+                      }
+                  : task
+              )
+            );
+            return;
+          }
+
+          setRenderQueue((current) =>
+            current.map((task) =>
+              task.id === firstVideo.id
+                ? task.status === "cancelled"
+                  ? task
+                  : {
+                      ...task,
+                      status: "failed",
+                      error: snapshot.error || "Provider job failed.",
+                      failedAt: new Date().toISOString(),
+                    }
+                : task
+            )
+          );
+          return;
+        }
+      } catch (error) {
+        if (cancelled) return;
+        setRenderQueue((current) =>
+          current.map((task) =>
+            task.id === firstVideo.id
+              ? task.status === "cancelled"
+                ? task
+                : {
+                    ...task,
+                    status: "failed",
+                    error: error instanceof Error ? error.message : "Provider job failed.",
+                    failedAt: new Date().toISOString(),
+                  }
+              : task
+          )
+        );
+      }
+    };
+
+    void run();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [effectiveMasterReferences, episodes, officialMasterReference, renderQueue]);
 
   if (!selectedEpisode) {
     return null;
@@ -1390,7 +1645,7 @@ export function FilmPackStudio() {
       setStoryIdea(snapshot.storyIdea || snapshot.series?.premise || "");
       setLockedVoiceOver(snapshot.lockedVoiceOver || "");
       setMasterReferenceUrls(snapshot.masterReferenceUrls || "");
-      setRenderQueue(snapshot.renderQueue || []);
+      setRenderQueue((snapshot.renderQueue || []).map(normalizeRenderTask));
       setImageProvider(snapshot.imageProvider || DEFAULT_IMAGE_PROVIDER);
       setVideoProvider(snapshot.videoProvider || DEFAULT_VIDEO_PROVIDER);
       setResult(null);
@@ -1437,10 +1692,36 @@ export function FilmPackStudio() {
         </div>
       </section>
 
+      <section className="mb-6 rounded-[28px] border border-white/10 bg-zinc-950/80 p-4">
+        <div className="mb-3 flex items-center justify-between gap-3">
+          <div>
+            <p className="text-xs uppercase tracking-[0.22em] text-zinc-500">How To Use This Studio</p>
+            <h2 className="mt-1 text-lg font-semibold text-zinc-100">Follow the workflow from story to scene assets</h2>
+          </div>
+          <p className="max-w-xl text-right text-xs text-zinc-400">
+            This studio does not output one finished episode file yet. It builds the story, scenes, prompts, images,
+            and per-scene video tasks in production order.
+          </p>
+        </div>
+        <div className="grid gap-3 xl:grid-cols-5">
+          {STUDIO_STEPS.map((item) => (
+            <div key={item.step} className="rounded-2xl border border-white/10 bg-white/[0.03] p-4">
+              <p className="text-[11px] uppercase tracking-[0.22em] text-cyan-300">{item.step}</p>
+              <p className="mt-2 text-sm font-semibold text-zinc-100">{item.title}</p>
+              <p className="mt-2 text-xs leading-relaxed text-zinc-400">{item.description}</p>
+            </div>
+          ))}
+        </div>
+      </section>
+
       <section className="grid gap-5 xl:grid-cols-[340px_minmax(0,1fr)_360px]">
         <aside className="space-y-4 xl:sticky xl:top-4 xl:self-start">
           <div className="rounded-3xl border border-white/10 bg-zinc-950/80 p-4">
             <p className="mb-3 text-xs uppercase tracking-[0.22em] text-zinc-500">Story Lab</p>
+            <p className="mb-4 text-sm leading-relaxed text-zinc-400">
+              Step 1. Use this panel to turn one idea into a series bible, then rebuild the season structure whenever
+              you want a new direction.
+            </p>
             <div className="grid gap-3">
               <label className="grid gap-1.5 text-sm">
                 <span className="text-zinc-300">Idea</span>
@@ -1485,22 +1766,28 @@ export function FilmPackStudio() {
                   className="rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-zinc-100 outline-none ring-cyan-300/40 focus:ring"
                 />
               </label>
-              <button
-                type="button"
-                onClick={onGenerateStory}
-                disabled={storyLoading}
-                className="rounded-xl border border-emerald-300/30 bg-emerald-400/10 px-4 py-2.5 text-sm font-semibold text-emerald-100 transition hover:bg-emerald-300/20 disabled:opacity-60"
-              >
-                {storyLoading ? "Generating Story..." : "Generate Story"}
-              </button>
-              <button
-                type="button"
-                onClick={onGenerateSeries}
-                disabled={seriesLoading}
-                className="rounded-xl bg-cyan-400 px-4 py-2.5 text-sm font-semibold text-zinc-950 transition hover:bg-cyan-300 disabled:opacity-60"
-              >
-                {seriesLoading ? "Generating Series..." : "Generate Series"}
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={onGenerateStory}
+                  disabled={storyLoading}
+                  className="flex-1 rounded-xl border border-emerald-300/30 bg-emerald-400/10 px-4 py-2.5 text-sm font-semibold text-emerald-100 transition hover:bg-emerald-300/20 disabled:opacity-60"
+                >
+                  {storyLoading ? "Generating Story..." : "Generate Story"}
+                </button>
+                <InfoTip text="Creates the story foundation: series title, premise, season arc, world, and main character setup." />
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={onGenerateSeries}
+                  disabled={seriesLoading}
+                  className="flex-1 rounded-xl bg-cyan-400 px-4 py-2.5 text-sm font-semibold text-zinc-950 transition hover:bg-cyan-300 disabled:opacity-60"
+                >
+                  {seriesLoading ? "Generating Series..." : "Generate Series"}
+                </button>
+                <InfoTip text="Expands the story into a season map with episode titles, hooks, summaries, and cliffhangers." />
+              </div>
               <div className="grid gap-2 sm:grid-cols-2">
               <button
                 type="button"
@@ -1545,6 +1832,10 @@ export function FilmPackStudio() {
 
           <div className="rounded-3xl border border-white/10 bg-zinc-950/80 p-4">
             <p className="mb-3 text-xs uppercase tracking-[0.22em] text-zinc-500">Project / World / Character</p>
+            <p className="mb-4 text-sm leading-relaxed text-zinc-400">
+              Step 2. This block defines the show bible: project identity, world rules, and the hero details that every
+              scene should inherit.
+            </p>
             <div className="grid gap-3">
               <label className="grid gap-1.5 text-sm">
                 <span className="text-zinc-300">Project Title</span>
@@ -1599,6 +1890,10 @@ export function FilmPackStudio() {
                 {episodes.length} total
               </span>
             </div>
+            <p className="mb-4 text-sm leading-relaxed text-zinc-400">
+              Step 3. Pick the episode you want to develop. The selected episode drives the middle workspace and the
+              right-side render queue.
+            </p>
             <div className="max-h-[540px] space-y-2 overflow-auto pr-1">
               {episodes.map((episode) => {
                 const active = episode.id === selectedEpisodeId;
@@ -1634,6 +1929,10 @@ export function FilmPackStudio() {
               <div>
                 <p className="text-xs uppercase tracking-[0.22em] text-zinc-500">Series Overview Board</p>
                 <h2 className="mt-1 text-xl font-semibold text-zinc-100">{series.seasonLabel} Episode Map</h2>
+                <p className="mt-2 text-sm leading-relaxed text-zinc-400">
+                  Step 3. Review the whole season, compare hooks and cliffhangers, and jump into any episode card to
+                  continue production.
+                </p>
               </div>
               <div className="flex flex-wrap gap-2 text-xs text-zinc-300">
                 <span className="rounded-full border border-white/10 bg-white/[0.03] px-3 py-1">
@@ -1734,6 +2033,10 @@ export function FilmPackStudio() {
                 <h2 className="mt-1 text-xl font-semibold text-zinc-100">
                   EP{selectedEpisode.episodeNumber} {selectedEpisode.title}
                 </h2>
+                <p className="mt-2 text-sm leading-relaxed text-zinc-400">
+                  Step 4. Build one episode at a time: shape the outline, generate scenes, storyboard shots, then
+                  create the episode pack.
+                </p>
               </div>
               <div className="flex flex-wrap gap-2">
                 <CopyButton text={masterStylePrompt} label="Copy master style" />
@@ -1745,21 +2048,27 @@ export function FilmPackStudio() {
                 >
                   {episodeLoading ? "Regenerating Episode..." : "Regenerate Episode"}
                 </button>
-                <button
-                  type="button"
-                  onClick={onGenerateEpisodeScenes}
-                  disabled={sceneLoading}
-                  className="rounded-xl border border-emerald-300/30 bg-emerald-400/10 px-3 py-2 text-sm font-medium text-emerald-100 transition hover:bg-emerald-300/20 disabled:opacity-60"
-                >
-                  {sceneLoading ? "Generating Scenes..." : "Generate Episode Scenes"}
-                </button>
-                <button
-                  type="button"
-                  onClick={autoStoryboardAll}
-                  className="rounded-xl border border-cyan-300/30 bg-cyan-400/10 px-3 py-2 text-sm font-medium text-cyan-100 transition hover:bg-cyan-400/20"
-                >
-                  Auto Storyboard
-                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={onGenerateEpisodeScenes}
+                    disabled={sceneLoading}
+                    className="rounded-xl border border-emerald-300/30 bg-emerald-400/10 px-3 py-2 text-sm font-medium text-emerald-100 transition hover:bg-emerald-300/20 disabled:opacity-60"
+                  >
+                    {sceneLoading ? "Generating Scenes..." : "Generate Episode Scenes"}
+                  </button>
+                  <InfoTip text="Breaks the selected episode into scene titles, purposes, and story beats." />
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={autoStoryboardAll}
+                    className="rounded-xl border border-cyan-300/30 bg-cyan-400/10 px-3 py-2 text-sm font-medium text-cyan-100 transition hover:bg-cyan-400/20"
+                  >
+                    Auto Storyboard
+                  </button>
+                  <InfoTip text="Generates shot type, camera, emotion, lighting, and prompts for all scenes in this episode." />
+                </div>
               </div>
             </div>
 
@@ -2033,14 +2342,17 @@ export function FilmPackStudio() {
               </button>
             </label>
             <div className="mt-4 grid gap-2">
-              <button
-                type="button"
-                onClick={onGenerate}
-                disabled={loading || beatLoading}
-                className="rounded-xl bg-cyan-400 px-4 py-2.5 text-sm font-semibold text-zinc-950 transition hover:bg-cyan-300 disabled:opacity-60"
-              >
-                {loading ? "Generating Episode..." : beatLoading ? "Generating Beat Sheet..." : "Generate Episode Pack"}
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={onGenerate}
+                  disabled={loading || beatLoading}
+                  className="flex-1 rounded-xl bg-cyan-400 px-4 py-2.5 text-sm font-semibold text-zinc-950 transition hover:bg-cyan-300 disabled:opacity-60"
+                >
+                  {loading ? "Generating Episode..." : beatLoading ? "Generating Beat Sheet..." : "Generate Episode Pack"}
+                </button>
+                <InfoTip text="Produces the structured episode package with beat sheet, prompts, and export-ready planning output." />
+              </div>
               <CopyButton text={originalScript} label="Copy episode script" />
             </div>
             {error ? <p className="mt-3 text-sm text-rose-300">{error}</p> : null}
@@ -2096,6 +2408,10 @@ export function FilmPackStudio() {
 
           <div className="rounded-3xl border border-white/10 bg-zinc-950/80 p-4">
             <p className="mb-3 text-xs uppercase tracking-[0.22em] text-zinc-500">Episode Summary</p>
+            <p className="mb-4 text-sm leading-relaxed text-zinc-400">
+              This panel is your quick episode brief. It summarizes what the current episode is trying to do before you
+              render any assets.
+            </p>
             <div className="space-y-2 text-sm text-zinc-300">
               <p><span className="font-semibold text-zinc-100">Series:</span> {series.seriesTitle}</p>
               <p><span className="font-semibold text-zinc-100">Episode:</span> EP{selectedEpisode.episodeNumber} {selectedEpisode.title}</p>
@@ -2113,20 +2429,26 @@ export function FilmPackStudio() {
             <div className="mb-3 flex items-center justify-between gap-2">
               <p className="text-xs uppercase tracking-[0.22em] text-zinc-500">Render Queue</p>
               <div className="flex flex-wrap gap-2">
-                <button
-                  type="button"
-                  onClick={() => queueCurrentEpisodeTasks("image")}
-                  className="rounded-full border border-emerald-300/20 bg-emerald-400/10 px-3 py-1 text-[11px] font-medium text-emerald-200 transition hover:bg-emerald-400/20"
-                >
-                  Queue Images
-                </button>
-                <button
-                  type="button"
-                  onClick={() => queueCurrentEpisodeTasks("video")}
-                  className="rounded-full border border-sky-300/20 bg-sky-400/10 px-3 py-1 text-[11px] font-medium text-sky-200 transition hover:bg-sky-400/20"
-                >
-                  Queue Videos
-                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => queueCurrentEpisodeTasks("image")}
+                    className="rounded-full border border-emerald-300/20 bg-emerald-400/10 px-3 py-1 text-[11px] font-medium text-emerald-200 transition hover:bg-emerald-400/20"
+                  >
+                    Queue Images
+                  </button>
+                  <InfoTip text="Adds one image render task for each scene in the current episode." />
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => queueCurrentEpisodeTasks("video")}
+                    className="rounded-full border border-sky-300/20 bg-sky-400/10 px-3 py-1 text-[11px] font-medium text-sky-200 transition hover:bg-sky-400/20"
+                  >
+                    Queue Videos
+                  </button>
+                  <InfoTip text="Adds one video job per scene, usually using the generated scene image as the starting frame." />
+                </div>
                 <button
                   type="button"
                   onClick={retryFailedEpisodeTasks}
@@ -2138,7 +2460,12 @@ export function FilmPackStudio() {
                 <button
                   type="button"
                   onClick={cancelActiveEpisodeTasks}
-                  disabled={!currentEpisodeRenderTasks.some((task) => task.status === "queued" || task.status === "running")}
+                  disabled={
+                    !currentEpisodeRenderTasks.some(
+                      (task) =>
+                        task.status === "queued" || task.status === "submitted" || task.status === "processing"
+                    )
+                  }
                   className="rounded-full border border-zinc-300/15 bg-zinc-400/10 px-3 py-1 text-[11px] font-medium text-zinc-200 transition hover:bg-zinc-400/20 disabled:opacity-40"
                 >
                   Cancel Active
@@ -2153,6 +2480,10 @@ export function FilmPackStudio() {
                 </button>
               </div>
             </div>
+            <p className="mb-4 text-sm leading-relaxed text-zinc-400">
+              Step 5. Queue scene images first, then queue scene videos. Each task here represents one scene asset, not
+              a full finished episode file.
+            </p>
             <div className="mb-3 grid gap-2 sm:grid-cols-2">
               <label className="grid gap-1 text-[11px] text-zinc-400">
                 <span>Image Provider</span>
@@ -2205,7 +2536,8 @@ export function FilmPackStudio() {
                 >
                   <option value="all">All statuses</option>
                   <option value="queued">Queued</option>
-                  <option value="running">Running</option>
+                  <option value="submitted">Submitted</option>
+                  <option value="processing">Processing</option>
                   <option value="completed">Completed</option>
                   <option value="failed">Failed</option>
                   <option value="cancelled">Cancelled</option>
@@ -2220,7 +2552,10 @@ export function FilmPackStudio() {
                 queued {currentEpisodeRenderTasks.filter((task) => task.status === "queued").length}
               </span>
               <span className="rounded-full border border-white/10 px-2 py-0.5">
-                running {currentEpisodeRenderTasks.filter((task) => task.status === "running").length}
+                submitted {currentEpisodeRenderTasks.filter((task) => task.status === "submitted").length}
+              </span>
+              <span className="rounded-full border border-white/10 px-2 py-0.5">
+                processing {currentEpisodeRenderTasks.filter((task) => task.status === "processing").length}
               </span>
               <span className="rounded-full border border-white/10 px-2 py-0.5">
                 done {currentEpisodeRenderTasks.filter((task) => task.status === "completed").length}
@@ -2259,7 +2594,7 @@ export function FilmPackStudio() {
                             Retry
                           </button>
                         ) : null}
-                        {(task.status === "queued" || task.status === "running") ? (
+                        {(task.status === "queued" || task.status === "submitted" || task.status === "processing") ? (
                           <button
                             type="button"
                             onClick={() => cancelRenderTask(task.id)}
@@ -2269,7 +2604,7 @@ export function FilmPackStudio() {
                           </button>
                         ) : null}
                       </div>
-                      {task.outputUrl ? (
+                      {task.outputUrl && /^https?:|^data:/.test(task.outputUrl) ? (
                         <a
                           href={task.outputUrl}
                           target="_blank"
@@ -2278,7 +2613,18 @@ export function FilmPackStudio() {
                         >
                           Open output
                         </a>
+                      ) : task.outputUrl ? (
+                        <p className="mt-2 text-xs text-cyan-300">Provider returned output: {task.outputUrl}</p>
                       ) : null}
+                      <div className="mt-2 grid gap-1 text-[11px] text-zinc-500">
+                        <p>Attempts: {task.attempts}</p>
+                        {task.providerJobId ? <p>Job ID: {task.providerJobId}</p> : null}
+                        {task.submittedAt ? <p>Submitted: {task.submittedAt}</p> : null}
+                        {task.processingAt ? <p>Processing: {task.processingAt}</p> : null}
+                        {task.completedAt ? <p>Completed: {task.completedAt}</p> : null}
+                        {task.failedAt ? <p>Failed: {task.failedAt}</p> : null}
+                        {task.cancelledAt ? <p>Cancelled: {task.cancelledAt}</p> : null}
+                      </div>
                       {task.kind === "video" ? (
                         <details className="mt-2">
                           <summary className="cursor-pointer text-xs text-zinc-400">Provider payload</summary>
