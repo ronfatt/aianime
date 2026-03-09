@@ -1212,6 +1212,32 @@ export function FilmPackStudio() {
     );
   };
 
+  const retryFailedEpisodeTasks = () => {
+    setRenderQueue((current) =>
+      current.map((task) =>
+        task.episodeId === selectedEpisode.id && (task.status === "failed" || task.status === "cancelled")
+          ? { ...task, status: "queued", error: "", outputUrl: undefined }
+          : task
+      )
+    );
+  };
+
+  const cancelActiveEpisodeTasks = () => {
+    setRenderQueue((current) =>
+      current.map((task) =>
+        task.episodeId === selectedEpisode.id && (task.status === "queued" || task.status === "running")
+          ? { ...task, status: "cancelled", error: task.error || "" }
+          : task
+      )
+    );
+  };
+
+  const clearCompletedEpisodeTasks = () => {
+    setRenderQueue((current) =>
+      current.filter((task) => !(task.episodeId === selectedEpisode.id && task.status === "completed"))
+    );
+  };
+
   useEffect(() => {
     const nextTask = renderQueue.find((task) => task.status === "queued" && task.kind === "image");
     if (!nextTask) return;
@@ -2092,7 +2118,7 @@ export function FilmPackStudio() {
           <div className="rounded-3xl border border-white/10 bg-zinc-950/80 p-4">
             <div className="mb-3 flex items-center justify-between gap-2">
               <p className="text-xs uppercase tracking-[0.22em] text-zinc-500">Render Queue</p>
-              <div className="flex gap-2">
+              <div className="flex flex-wrap gap-2">
                 <button
                   type="button"
                   onClick={() => queueCurrentEpisodeTasks("image")}
@@ -2106,6 +2132,30 @@ export function FilmPackStudio() {
                   className="rounded-full border border-sky-300/20 bg-sky-400/10 px-3 py-1 text-[11px] font-medium text-sky-200 transition hover:bg-sky-400/20"
                 >
                   Queue Videos
+                </button>
+                <button
+                  type="button"
+                  onClick={retryFailedEpisodeTasks}
+                  disabled={!currentEpisodeRenderTasks.some((task) => task.status === "failed" || task.status === "cancelled")}
+                  className="rounded-full border border-cyan-300/20 bg-cyan-400/10 px-3 py-1 text-[11px] font-medium text-cyan-200 transition hover:bg-cyan-400/20 disabled:opacity-40"
+                >
+                  Retry Failed
+                </button>
+                <button
+                  type="button"
+                  onClick={cancelActiveEpisodeTasks}
+                  disabled={!currentEpisodeRenderTasks.some((task) => task.status === "queued" || task.status === "running")}
+                  className="rounded-full border border-zinc-300/15 bg-zinc-400/10 px-3 py-1 text-[11px] font-medium text-zinc-200 transition hover:bg-zinc-400/20 disabled:opacity-40"
+                >
+                  Cancel Active
+                </button>
+                <button
+                  type="button"
+                  onClick={clearCompletedEpisodeTasks}
+                  disabled={!currentEpisodeRenderTasks.some((task) => task.status === "completed")}
+                  className="rounded-full border border-white/10 bg-white/[0.03] px-3 py-1 text-[11px] font-medium text-zinc-200 transition hover:bg-white/[0.08] disabled:opacity-40"
+                >
+                  Clear Completed
                 </button>
               </div>
             </div>
