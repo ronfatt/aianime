@@ -366,8 +366,13 @@ function normalizeRenderTask(task: RenderTask): RenderTask {
   };
 }
 
+function isPreviewableMediaUrl(url?: string): boolean {
+  return typeof url === "string" && /^(https?:|data:)/.test(url);
+}
+
 export function FilmPackStudio() {
   const importInputRef = useRef<HTMLInputElement | null>(null);
+  const renderQueueRef = useRef<RenderTask[]>([]);
   const [series, setSeries] = useState<StudioSeries>(defaultSeries);
   const [project, setProject] = useState<StudioProject>(defaultProject);
   const [world, setWorld] = useState<StudioWorld>(defaultWorld);
@@ -384,6 +389,8 @@ export function FilmPackStudio() {
   const [seriesLoading, setSeriesLoading] = useState(false);
   const [episodeLoading, setEpisodeLoading] = useState(false);
   const [sceneLoading, setSceneLoading] = useState(false);
+  const [oneClickLoading, setOneClickLoading] = useState(false);
+  const [oneClickStage, setOneClickStage] = useState<string | null>(null);
   const [lockedVoiceOver, setLockedVoiceOver] = useState("");
   const [masterReferenceImages, setMasterReferenceImages] = useState<string[]>([]);
   const [masterReferenceUrls, setMasterReferenceUrls] = useState("");
@@ -473,6 +480,24 @@ export function FilmPackStudio() {
       }),
     [currentEpisodeRenderTasks, queueKindFilter, queueStatusFilter]
   );
+  const completedEpisodeVideos = useMemo(
+    () =>
+      currentEpisodeRenderTasks.filter(
+        (task) => task.kind === "video" && task.status === "completed" && isPreviewableMediaUrl(task.outputUrl)
+      ),
+    [currentEpisodeRenderTasks]
+  );
+  const completedEpisodeImages = useMemo(
+    () =>
+      currentEpisodeRenderTasks.filter(
+        (task) => task.kind === "image" && task.status === "completed" && isPreviewableMediaUrl(task.outputUrl)
+      ),
+    [currentEpisodeRenderTasks]
+  );
+
+  useEffect(() => {
+    renderQueueRef.current = renderQueue;
+  }, [renderQueue]);
 
   useEffect(() => {
     setEpisodes((current) =>
@@ -730,18 +755,59 @@ export function FilmPackStudio() {
     );
   };
 
-  const autoStoryboardAll = () => {
+  const storyboardScenes = (scenes: StudioScene[]) =>
+    scenes.map((scene) => ({
+      ...scene,
+      shot: createStoryboardShot(scene, masterStylePrompt, character),
+    }));
+
+  const autoStoryboardAll = (overrideScenes?: StudioScene[]) => {
     if (!selectedEpisode) return;
     setEpisodes((current) =>
       updateEpisodeById(current, selectedEpisode.id, (episode) => ({
         ...episode,
         status: promoteEpisodeStatus(episode.status, "storyboard"),
-        scenes: episode.scenes.map((scene) => ({
-          ...scene,
-          shot: createStoryboardShot(scene, masterStylePrompt, character),
-        })),
+        scenes: overrideScenes || storyboardScenes(episode.scenes),
       }))
     );
+  };
+
+  const generateEpisodeScenesForSelected = async (): Promise<StudioScene[]> => {
+    if (!selectedEpisode) {
+      throw new Error("No episode selected.");
+    }
+
+    const response = await fetch("/api/generate-episode-scenes", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        seriesTitle: series.seriesTitle,
+        premise: series.premise,
+        seasonArc: series.seasonArc,
+        style,
+        genre: project.genre,
+        tone: project.tone,
+        world: `${world.setting}; ${world.environment}; ${world.weather}; ${world.architecture}; palette ${world.palette}`,
+        character: `${character.name}; ${character.role}; ${character.appearance}; ${character.outfit}; ${character.power}`,
+        episodeNumber: selectedEpisode.episodeNumber,
+        episodeTitle: selectedEpisode.title,
+        summary: selectedEpisode.summary,
+        hook: selectedEpisode.hook,
+        conflict: selectedEpisode.conflict,
+        action: selectedEpisode.action,
+        climax: selectedEpisode.climax,
+        ending: selectedEpisode.ending,
+        cliffhanger: selectedEpisode.cliffhanger,
+        sceneCount: 10,
+      }),
+    });
+
+    const payload = (await response.json().catch(() => null)) as (GenerateEpisodeScenesResponse & { error?: string }) | null;
+    if (!response.ok || !payload?.scenes) {
+      throw new Error(payload?.error || "Episode scene generation failed.");
+    }
+
+    return mergeGeneratedScenes(payload.scenes, selectedEpisode.scenes);
   };
 
   const onGenerateSeries = async () => {
@@ -910,41 +976,13 @@ export function FilmPackStudio() {
     setError(null);
 
     try {
-      const response = await fetch("/api/generate-episode-scenes", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          seriesTitle: series.seriesTitle,
-          premise: series.premise,
-          seasonArc: series.seasonArc,
-          style,
-          genre: project.genre,
-          tone: project.tone,
-          world: `${world.setting}; ${world.environment}; ${world.weather}; ${world.architecture}; palette ${world.palette}`,
-          character: `${character.name}; ${character.role}; ${character.appearance}; ${character.outfit}; ${character.power}`,
-          episodeNumber: selectedEpisode.episodeNumber,
-          episodeTitle: selectedEpisode.title,
-          summary: selectedEpisode.summary,
-          hook: selectedEpisode.hook,
-          conflict: selectedEpisode.conflict,
-          action: selectedEpisode.action,
-          climax: selectedEpisode.climax,
-          ending: selectedEpisode.ending,
-          cliffhanger: selectedEpisode.cliffhanger,
-          sceneCount: 10,
-        }),
-      });
-
-      const payload = (await response.json().catch(() => null)) as (GenerateEpisodeScenesResponse & { error?: string }) | null;
-      if (!response.ok || !payload?.scenes) {
-        throw new Error(payload?.error || "Episode scene generation failed.");
-      }
+      const mergedScenes = await generateEpisodeScenesForSelected();
 
       setEpisodes((current) =>
         updateEpisodeById(current, selectedEpisode.id, (episode) => ({
           ...episode,
           status: promoteEpisodeStatus(episode.status, "scenes"),
-          scenes: mergeGeneratedScenes(payload.scenes, episode.scenes),
+          scenes: mergedScenes,
         }))
       );
       setResult(null);
@@ -1130,6 +1168,54 @@ export function FilmPackStudio() {
     }
   };
 
+  const generateEpisodePackForSelected = async () => {
+    if (!selectedEpisode) {
+      throw new Error("No episode selected.");
+    }
+
+    const beatResponse = await generateBeatSheet();
+    const response = await fetch("/api/generate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        settings: {
+          title: `${series.seriesTitle} - EP${selectedEpisode.episodeNumber} ${selectedEpisode.title}`,
+          originalScript,
+          lockedVoiceOver,
+          referenceTag,
+          sceneCount,
+          style,
+          colorGradePreset,
+          strictMode,
+        },
+        beatSheet: beatResponse.beatSheet,
+      }),
+    });
+
+    if (!response.ok) {
+      const payload = (await response.json().catch(() => null)) as { error?: string } | null;
+      throw new Error(payload?.error || "Anime pack generation failed.");
+    }
+
+    const payload = (await response.json()) as GenerateResponse;
+    setResult(payload.filmPack);
+    setEpisodes((current) =>
+      updateEpisodeById(current, selectedEpisode.id, (episode) => ({
+        ...episode,
+        status: promoteEpisodeStatus(episode.status, "generated"),
+      }))
+    );
+    setBeatSheet(payload.filmPack.beatSheet || beatResponse.beatSheet);
+    setBeatSceneCount(payload.filmPack.beatSheet?.length || beatResponse.sceneCount);
+    setSceneImages({});
+    setCompanionImages({});
+    setSceneImageLoading({});
+    setCompanionImageLoading({});
+    setSceneImageErrors({});
+    setCompanionImageErrors({});
+    setCompanionLoading({});
+  };
+
   const onGenerate = async () => {
     if (!selectedEpisode) return;
 
@@ -1137,47 +1223,7 @@ export function FilmPackStudio() {
     setError(null);
 
     try {
-      const beatResponse = await generateBeatSheet();
-      const response = await fetch("/api/generate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          settings: {
-            title: `${series.seriesTitle} - EP${selectedEpisode.episodeNumber} ${selectedEpisode.title}`,
-            originalScript,
-            lockedVoiceOver,
-            referenceTag,
-            sceneCount,
-            style,
-            colorGradePreset,
-            strictMode,
-          },
-          beatSheet: beatResponse.beatSheet,
-        }),
-      });
-
-      if (!response.ok) {
-        const payload = (await response.json().catch(() => null)) as { error?: string } | null;
-        throw new Error(payload?.error || "Anime pack generation failed.");
-      }
-
-      const payload = (await response.json()) as GenerateResponse;
-      setResult(payload.filmPack);
-      setEpisodes((current) =>
-        updateEpisodeById(current, selectedEpisode.id, (episode) => ({
-          ...episode,
-          status: promoteEpisodeStatus(episode.status, "generated"),
-        }))
-      );
-      setBeatSheet(payload.filmPack.beatSheet || beatResponse.beatSheet);
-      setBeatSceneCount(payload.filmPack.beatSheet?.length || beatResponse.sceneCount);
-      setSceneImages({});
-      setCompanionImages({});
-      setSceneImageLoading({});
-      setCompanionImageLoading({});
-      setSceneImageErrors({});
-      setCompanionImageErrors({});
-      setCompanionLoading({});
+      await generateEpisodePackForSelected();
     } catch (requestError) {
       const message = requestError instanceof Error ? requestError.message : "Anime pack generation failed.";
       setError(message);
@@ -1195,7 +1241,8 @@ export function FilmPackStudio() {
     episodes,
   };
 
-  const queueCurrentEpisodeTasks = (kind: RenderTask["kind"]) => {
+  const queueCurrentEpisodeTasks = (kind: RenderTask["kind"], scenesOverride?: StudioScene[]) => {
+    const targetScenes = scenesOverride || currentScenes;
     const provider = kind === "image" ? imageProvider : videoProvider;
 
     setRenderQueue((current) => {
@@ -1203,7 +1250,7 @@ export function FilmPackStudio() {
         (task) => !(task.episodeId === selectedEpisode.id && task.kind === kind && task.status === "queued")
       );
 
-      const additions = currentScenes.map((scene) => {
+      const additions = targetScenes.map((scene) => {
         const completedImageTask = current
           .slice()
           .reverse()
@@ -1247,6 +1294,67 @@ export function FilmPackStudio() {
 
       return [...freshTasks, ...additions];
     });
+  };
+
+  const waitForEpisodeImageTasks = async (episodeId: string, expectedCount: number) => {
+    const startedAt = Date.now();
+
+    while (Date.now() - startedAt < 180000) {
+      const episodeImageTasks = renderQueueRef.current.filter(
+        (task) => task.episodeId === episodeId && task.kind === "image"
+      );
+      const activeImageTasks = episodeImageTasks.filter(
+        (task) => task.status === "queued" || task.status === "submitted" || task.status === "processing"
+      );
+
+      if (episodeImageTasks.length >= expectedCount && activeImageTasks.length === 0) {
+        return;
+      }
+
+      await sleep(400);
+    }
+
+    throw new Error("Timed out while waiting for episode images to finish.");
+  };
+
+  const onOneClickEpisode = async () => {
+    if (!selectedEpisode) return;
+
+    setOneClickLoading(true);
+    setOneClickStage("Preparing scenes");
+    setError(null);
+
+    try {
+      const mergedScenes = await generateEpisodeScenesForSelected();
+      const storyboardedScenes = storyboardScenes(mergedScenes);
+
+      setEpisodes((current) =>
+        updateEpisodeById(current, selectedEpisode.id, (episode) => ({
+          ...episode,
+          status: promoteEpisodeStatus(promoteEpisodeStatus(episode.status, "scenes"), "storyboard"),
+          scenes: storyboardedScenes,
+        }))
+      );
+      setResult(null);
+      setBeatSheet([]);
+      setBeatSceneCount(null);
+
+      setOneClickStage("Building storyboard");
+      queueCurrentEpisodeTasks("image", storyboardedScenes);
+      setOneClickStage("Rendering images");
+      await waitForEpisodeImageTasks(selectedEpisode.id, storyboardedScenes.length);
+      setOneClickStage("Queueing videos");
+      queueCurrentEpisodeTasks("video", storyboardedScenes);
+      setOneClickStage("Generating pack");
+      await generateEpisodePackForSelected();
+      setOneClickStage("Done");
+    } catch (generationError) {
+      const message = generationError instanceof Error ? generationError.message : "One Click Episode failed.";
+      setError(message);
+      setOneClickStage("Failed");
+    } finally {
+      setOneClickLoading(false);
+    }
   };
 
   const retryRenderTask = (taskId: string) => {
@@ -2040,6 +2148,22 @@ export function FilmPackStudio() {
               </div>
               <div className="flex flex-wrap gap-2">
                 <CopyButton text={masterStylePrompt} label="Copy master style" />
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={onOneClickEpisode}
+                    disabled={oneClickLoading || sceneLoading}
+                    className="rounded-xl bg-fuchsia-400 px-3 py-2 text-sm font-semibold text-zinc-950 transition hover:bg-fuchsia-300 disabled:opacity-60"
+                  >
+                    {oneClickLoading ? "Building Episode..." : "One Click Episode+"}
+                  </button>
+                  <InfoTip text="Runs the full sequence for the current episode: Generate Episode Scenes, Auto Storyboard, Queue Images, wait for image tasks to finish, Queue Videos, then Generate Episode Pack." />
+                </div>
+                {oneClickStage ? (
+                  <span className="self-center rounded-full border border-white/10 bg-white/[0.03] px-3 py-2 text-xs text-zinc-300">
+                    {oneClickStage}
+                  </span>
+                ) : null}
                 <button
                   type="button"
                   onClick={onRegenerateEpisode}
@@ -2062,7 +2186,7 @@ export function FilmPackStudio() {
                 <div className="flex items-center gap-2">
                   <button
                     type="button"
-                    onClick={autoStoryboardAll}
+                    onClick={() => autoStoryboardAll()}
                     className="rounded-xl border border-cyan-300/30 bg-cyan-400/10 px-3 py-2 text-sm font-medium text-cyan-100 transition hover:bg-cyan-400/20"
                   >
                     Auto Storyboard
@@ -2426,6 +2550,58 @@ export function FilmPackStudio() {
           </div>
 
           <div className="rounded-3xl border border-white/10 bg-zinc-950/80 p-4">
+            <p className="mb-3 text-xs uppercase tracking-[0.22em] text-zinc-500">Episode Assets</p>
+            <p className="mb-4 text-sm leading-relaxed text-zinc-400">
+              Preview the latest finished scene assets for this episode. Images are keyframes, videos are per-scene clips.
+            </p>
+            <div className="mb-3 flex flex-wrap gap-2 text-[11px] text-zinc-400">
+              <span className="rounded-full border border-white/10 px-2 py-0.5">
+                {completedEpisodeImages.length} images
+              </span>
+              <span className="rounded-full border border-white/10 px-2 py-0.5">
+                {completedEpisodeVideos.length} videos
+              </span>
+            </div>
+            {completedEpisodeVideos.length > 0 ? (
+              <div className="space-y-3">
+                {completedEpisodeVideos
+                  .slice()
+                  .reverse()
+                  .slice(0, 2)
+                  .map((task) => (
+                    <div key={`asset-video-${task.id}`} className="rounded-2xl border border-white/10 bg-black/20 p-3">
+                      <p className="text-xs font-medium text-zinc-100">{task.sceneTitle}</p>
+                      <video
+                        src={task.outputUrl}
+                        controls
+                        playsInline
+                        className="mt-2 w-full rounded-xl border border-white/10 bg-black"
+                      />
+                    </div>
+                  ))}
+              </div>
+            ) : completedEpisodeImages.length > 0 ? (
+              <div className="grid grid-cols-2 gap-2">
+                {completedEpisodeImages
+                  .slice()
+                  .reverse()
+                  .slice(0, 4)
+                  .map((task) => (
+                    <div key={`asset-image-${task.id}`} className="overflow-hidden rounded-2xl border border-white/10 bg-black/20">
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img src={task.outputUrl} alt={task.sceneTitle} className="h-28 w-full object-cover" />
+                      <div className="border-t border-white/10 px-3 py-2">
+                        <p className="text-[11px] text-zinc-300">{task.sceneTitle}</p>
+                      </div>
+                    </div>
+                  ))}
+              </div>
+            ) : (
+              <p className="text-sm text-zinc-500">No completed assets yet for this episode.</p>
+            )}
+          </div>
+
+          <div className="rounded-3xl border border-white/10 bg-zinc-950/80 p-4">
             <div className="mb-3 flex items-center justify-between gap-2">
               <p className="text-xs uppercase tracking-[0.22em] text-zinc-500">Render Queue</p>
               <div className="flex flex-wrap gap-2">
@@ -2604,7 +2780,17 @@ export function FilmPackStudio() {
                           </button>
                         ) : null}
                       </div>
-                      {task.outputUrl && /^https?:|^data:/.test(task.outputUrl) ? (
+                      {task.kind === "video" && isPreviewableMediaUrl(task.outputUrl) ? (
+                        <div className="mt-2">
+                          <video
+                            src={task.outputUrl}
+                            controls
+                            playsInline
+                            className="w-full rounded-xl border border-white/10 bg-black"
+                          />
+                        </div>
+                      ) : null}
+                      {task.outputUrl && isPreviewableMediaUrl(task.outputUrl) ? (
                         <a
                           href={task.outputUrl}
                           target="_blank"
